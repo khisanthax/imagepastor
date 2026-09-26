@@ -1,0 +1,80 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Segoe UI", sans-serif;
+}
+
+body {
+  width: 300px;
+  margin: 0;
+  color: CanvasText;
+  background: Canvas;
+}
+
+main {
+  padding: 16px;
+}
+
+h1 {
+  margin: 0 0 16px;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+#detector-status,
+#test-result,
+#detector-detail {
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.toggle-row,
+.volume-row {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+}
+
+.secondary {
+  margin-top: 12px;
+}
+
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #16835d;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: #16835d;
+}
+
+button {
+  width: 100%;
+  min-height: 34px;
+  margin-top: 16px;
+  border: 1px solid ButtonBorder;
+  border-radius: 6px;
+  color: ButtonText;
+  background: ButtonFace;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(0.96);
+}
+
+details {
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+summary {
+  cursor: pointer;
+}

@@ -1,0 +1,24 @@
+{
+  "hotkey": {
+    "modifiers": ["ctrl", "alt"],
+    "key": "v"
+  },
+  "target_hotkey": {
+    "modifiers": ["ctrl", "alt", "shift"],
+    "key": "v"
+  },
+  "monitor_sleep_hotkey": {
+    "modifiers": ["ctrl", "alt", "shift"],
+    "key": "m"
+  },
+  "chatgpt_allowed_hosts": ["chatgpt.com", "chat.openai.com"],
+  "auto_click_composer": true,
+  "composer_click_offset_from_bottom": 90,
+  "restore_mouse_position": true,
+  "paste_delay_ms": 250,
+  "monitor_sleep_delay_ms": 750,
+  "monitor_sleep_guard_interval_seconds": 15,
+  "save_captures": false,
+  "capture_directory": "captures",
+  "start_enabled": true
+}

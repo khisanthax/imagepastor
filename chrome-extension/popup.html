@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ImagePastor Chime</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>Completion chime</h1>
+    <p id="detector-status" role="status">Checking ChatGPT tab...</p>
+    <label class="toggle-row">
+      <span>Enabled</span>
+      <input id="enabled" type="checkbox">
+    </label>
+    <label class="volume-row" for="volume">
+      <span>Volume</span>
+      <output id="volume-value">55%</output>
+    </label>
+    <input id="volume" type="range" min="0" max="100" step="5">
+    <label class="toggle-row secondary">
+      <span>Only when ChatGPT is not focused</span>
+      <input id="only-unfocused" type="checkbox">
+    </label>
+    <button id="test" type="button">Test chime</button>
+    <p id="test-result" role="status" hidden></p>
+    <details>
+      <summary>Development</summary>
+      <p id="detector-detail"></p>
+      <label class="toggle-row secondary">
+        <span>Console logging</span>
+        <input id="debug" type="checkbox">
+      </label>
+    </details>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
