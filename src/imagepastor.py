@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from PIL import Image, ImageDraw, ImageGrab
 from face_wake import FaceWatcher, worker_main
 from runtime_diagnostics import RuntimeDiagnostics
+from away_sleep import AwayGate
 from lpha_autofill import AutofillAbort, WindowsBackend, fill as fill_lpha
 
 try:
@@ -239,6 +240,8 @@ active_config: dict | None = None
 face_watcher = FaceWatcher()
 face_wake_cancel: threading.Event | None = None
 face_wake_session_locked = False
+auto_sleep_cancel: threading.Event | None = None
+app_shutting_down = False
 STARTUP_APP_NAME = "ImagePastor"
 STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CHROME_APP_PATHS_KEY = r"Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
@@ -316,9 +319,11 @@ def monitor_control_window_proc(hwnd, message, wparam, lparam):
             with monitor_sleep_guard_lock:
                 face_wake_session_locked = True
                 stop_face_wake()
+                stop_auto_sleep()
         if wparam == WTS_SESSION_UNLOCK:
             face_wake_session_locked = False
             wake_monitors_after_unlock()
+            start_auto_sleep(active_config or {})
         return 0
     if message == WM_MONITOR_POWER:
         apply_monitor_power(hwnd, int(wparam), int(lparam))
@@ -600,6 +605,7 @@ def load_config() -> dict:
         "monitor_sleep_delay_ms": 750,
         "monitor_sleep_guard_interval_seconds": 15,
         "face_wake_enabled": False,
+        "auto_sleep_enabled": False,
         "face_wake_camera_index": 0,
         "save_captures": False,
         "capture_directory": "captures",
@@ -1396,7 +1402,7 @@ def monitor_sleep_guard(config: dict, cancel_event: threading.Event) -> None:
             log("Windows system-sleep prevention released.")
 
 
-def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
+def set_monitor_sleep_guard(enabled: bool, config: dict, *, already_away=False) -> None:
     global monitor_sleep_guard_enabled
     global monitor_sleep_guard_cancel_event
     global monitor_sleep_once_cancel_event
@@ -1414,6 +1420,7 @@ def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
             monitor_sleep_once_cancel_event.set()
             monitor_sleep_once_cancel_event = None
         monitor_sleep_guard_enabled = enabled
+        stop_auto_sleep()
         if enabled:
             cancel_event = threading.Event()
             monitor_sleep_guard_cancel_event = cancel_event
@@ -1439,8 +1446,109 @@ def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
             log("Could not request immediate monitor wake.")
     if worker is not None:
         worker.start()
-        start_face_wake(config)
+        # Auto-sleep has already established departure; manual sleep has not.
+        wake_config = {**config, "_face_wake_armed": True} if already_away else config
+        start_face_wake(wake_config)
+    elif not app_shutting_down:
+        start_auto_sleep(config)
     update_tray_icon()
+
+
+def last_input_idle_seconds():
+    class LastInput(ctypes.Structure):
+        _fields_ = [("size", wintypes.UINT), ("tick", wintypes.DWORD)]
+    info = LastInput(ctypes.sizeof(LastInput), 0)
+    user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LastInput)]
+    user32.GetLastInputInfo.restype = wintypes.BOOL
+    kernel32.GetTickCount.restype = wintypes.DWORD
+    if not user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+    elapsed = (kernel32.GetTickCount() - info.tick) & 0xFFFFFFFF
+    return elapsed / 1000 if elapsed < 0x80000000 else None
+
+
+def desktop_is_unlocked():
+    user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    handle = user32.OpenInputDesktop(0, False, 1)
+    if not handle:
+        return False
+    try:
+        name = ctypes.create_unicode_buffer(256)
+        needed = wintypes.DWORD()
+        return bool(user32.GetUserObjectInformationW(handle, 2, name, ctypes.sizeof(name), ctypes.byref(needed))
+                    and name.value.casefold() == "default")
+    finally:
+        user32.CloseDesktop(handle)
+
+
+def stop_auto_sleep():
+    global auto_sleep_cancel
+    if auto_sleep_cancel is not None:
+        auto_sleep_cancel.set()
+        auto_sleep_cancel = None
+
+
+def start_auto_sleep(config):
+    global auto_sleep_cancel
+    with monitor_sleep_guard_lock:
+        stop_auto_sleep()
+        if (not config.get("auto_sleep_enabled", False) or monitor_sleep_guard_enabled
+                or face_wake_session_locked or app_shutting_down or not desktop_is_unlocked()):
+            return
+        cancel = threading.Event()
+        auto_sleep_cancel = cancel
+        gate = AwayGate()
+
+        def observe(status):
+            with monitor_sleep_guard_lock:
+                if (cancel.is_set() or auto_sleep_cancel is not cancel or monitor_sleep_guard_enabled
+                        or face_wake_session_locked or app_shutting_down):
+                    return
+                if not desktop_is_unlocked() or lpha_lock.locked():
+                    gate.reset()
+                    return
+                if gate.observe(status, time.monotonic(), last_input_idle_seconds()):
+                    log("15 minutes without a face or keyboard/mouse activity; enabling monitor sleep guard.")
+                    set_monitor_sleep_guard(True, config, already_away=True)
+
+        threading.Thread(target=face_watcher.run, args=(cancel, dict(config), None, log),
+                         kwargs={"observe": observe}, daemon=False, name="ImagePastorAutoSleep").start()
+
+
+def toggle_auto_sleep(_icon=None, _item=None):
+    if active_config is None:
+        return
+    temporary = None
+    try:
+        enabled = not active_config.get("auto_sleep_enabled", False)
+        path = app_dir() / "config.json"
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        saved["auto_sleep_enabled"] = enabled
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         delete=False, suffix=".tmp") as handle:
+            temporary = Path(handle.name)
+            json.dump(saved, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        active_config["auto_sleep_enabled"] = enabled
+        with monitor_sleep_guard_lock:
+            if enabled:
+                start_auto_sleep(active_config)
+            else:
+                stop_auto_sleep()
+        log(f"15-minute away auto-sleep {'enabled' if enabled else 'disabled'}.")
+        update_tray_icon()
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"Could not save auto-sleep setting ({type(exc).__name__}).")
+        show_error("ImagePastor", "Could not save the auto-sleep setting.")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def stop_face_wake() -> None:
@@ -1691,6 +1799,8 @@ def run_tray() -> None:
             pystray.MenuItem("Wake Monitors", tray_wake_monitors),
             pystray.MenuItem("Wake on Face", toggle_face_wake,
                              checked=lambda _item: bool(active_config and active_config.get("face_wake_enabled", False))),
+            pystray.MenuItem("Auto Sleep After 15 Min Away", toggle_auto_sleep,
+                             checked=lambda _item: bool(active_config and active_config.get("auto_sleep_enabled", False))),
             pystray.MenuItem("Set Up ChatGPT Chime", open_chime_extension_setup),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda _item: startup_enabled()),
             pystray.MenuItem("Exit", tray_exit),
@@ -1721,6 +1831,7 @@ def main() -> int:
     global hotkey_thread_id
     global active_config
     global diagnostics
+    global app_shutting_down
 
     configure_win32_signatures()
     mutex = kernel32.CreateMutexW(None, False, "ImagePastorSingleInstance")
@@ -1775,6 +1886,7 @@ def main() -> int:
         f"Monitor sleep guard hotkey: {monitor_combo}."
     )
     threading.Thread(target=run_tray, daemon=True).start()
+    start_auto_sleep(config)
 
     msg = MSG()
     try:
@@ -1809,6 +1921,8 @@ def main() -> int:
     except KeyboardInterrupt:
         log("Exiting.")
     finally:
+        app_shutting_down = True
+        stop_auto_sleep()
         cancel_lpha_autofill()
         set_monitor_sleep_guard(False, config)
         user32.UnregisterHotKey(None, CAPTURE_HOTKEY_ID)

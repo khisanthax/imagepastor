@@ -46,6 +46,7 @@ class ReleasePackagingTests(unittest.TestCase):
         defaults = json.loads((ROOT / "installer/default-config.json").read_text())
         self.assertFalse(defaults["lpha_enabled"])
         self.assertFalse(defaults["face_wake_enabled"])
+        self.assertFalse(defaults["auto_sleep_enabled"])
         self.assertFalse(defaults["save_captures"])
 
     def test_disabled_macro_does_not_register_or_start_a_worker(self):

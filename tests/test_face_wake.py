@@ -15,6 +15,12 @@ import imagepastor
 
 
 class FaceGateTests(unittest.TestCase):
+    def test_auto_sleep_can_wake_on_return_without_a_second_departure(self):
+        gate = face_wake.FaceGate(armed=True)
+        for tick in range(4):
+            self.assertFalse(gate.observe(True, tick * 0.25))
+        self.assertTrue(gate.observe(True, 1.0))
+
     def arm(self, gate):
         for tick in range(9):
             self.assertFalse(gate.observe(False, tick * 0.25))

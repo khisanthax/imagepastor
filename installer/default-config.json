@@ -1,5 +1,6 @@
 {
   "face_wake_enabled": false,
+  "auto_sleep_enabled": false,
   "face_wake_camera_index": 0,
   "lpha_enabled": false,
   "save_captures": false

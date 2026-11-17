@@ -11,6 +11,7 @@ chimes. Python is bundled in the installer; no OpenAI API key is required.
 | Screenshot and paste | Captures the visible window under the pointer and attaches the image to a verified ChatGPT browser composer. It does not send the message. |
 | Vivaldi tiles | Captures just the web page in the tile under the pointer and can pin a separate ChatGPT destination tile, including tiles with identical titles. |
 | Monitor sleep guard | Keeps Windows running for background work while repeatedly enforcing display-off when necessary. |
+| Optional away auto-sleep | Enables the existing guard after 15 minutes with both no detected face and no keyboard/mouse activity. Camera failures never count as absence. Disabled by default. |
 | Optional face wake | Uses a local color webcam to detect any face after you have stepped away, disable the guard, and wake the monitors. Disabled on fresh installs. |
 | ChatGPT completion chime | Optional Chrome/Vivaldi extension plays a local sound after a response finishes. Requires manual browser setup. |
 | Codex completion chime | Bundled dispatcher assets support a separately configured completion hook; they are not automatically installed into Codex. |
@@ -23,8 +24,8 @@ or suspend the PC; use Windows' normal lock and authentication separately.
 
 ## Install on Windows
 
-Download `ImagePastor-Setup-1.1.0-windows-x64.exe` from the
-[GitHub release](https://github.com/khisanthax/imagepastor/releases/tag/v1.1.0).
+Download `ImagePastor-Setup-1.2.0-windows-x64.exe` from the
+[GitHub release](https://github.com/khisanthax/imagepastor/releases/tag/v1.2.0).
 The repository and release are public; no GitHub account or repository invitation
 is required to download. You can also transfer the installer to another PC.
 No Python installation is needed.
@@ -36,7 +37,7 @@ ImagePastor and its diagnostic companion before installing an upgrade or uninsta
 Existing settings are retained. Uninstall through Windows Installed Apps; local
 settings and logs remain unless you remove them yourself.
 
-Fresh installs have face wake, screenshot saving, and the owner-specific LPHA macro
+Fresh installs have face wake, away auto-sleep, screenshot saving, and the owner-specific LPHA macro
 disabled. Your camera index, local logs, browser targets, and personal configuration
 are not included in the installer. To deliberately enable LPHA on an appropriate
 workstation, set `"lpha_enabled": true` in its local `config.json` and restart.
@@ -52,7 +53,7 @@ does not access browser profiles or change browser permissions.
 
 Install Inno Setup 6, then run `./build-installer.ps1`. The installer and checksum
 are written to `releases/`. The build uses an isolated allowlisted payload under
-`build/installer-1.1.0/`, never the developer's live `dist/` directory. Provide
+`build/installer-1.2.0/`, never the developer's live `dist/` directory. Provide
 `-Compiler` when Inno Setup is installed elsewhere. Third-party license notices
 and dependency versions are included in the package. Each version uses a fresh
 build directory to avoid stale files. Installer compilation uses Inno Setup's
@@ -144,6 +145,7 @@ Useful settings:
 - `monitor_sleep_hotkey`: change the hotkey used to toggle the monitor sleep guard.
 - `capture_vivaldi_tile`: capture only the hovered Vivaldi page (default `true`).
 - `face_wake_enabled`: opt in to local camera-based wake (default `false`).
+- `auto_sleep_enabled`: opt in to 15-minute no-face plus input-idle auto-sleep (default `false`).
 - `face_wake_camera_index`: choose the DirectShow camera number (default `0`).
 - `lpha_enabled`: enable the specialized LPHA hotkeys/menu; the installer sets this to `false`.
 - `chatgpt_allowed_hosts`: browser address hosts that are permitted to receive screenshots.
@@ -173,8 +175,9 @@ Useful settings:
   after pressing the sleep hotkey; simply remaining seated will not wake them again.
   Any face (or a convincing face image) may trigger this: it is not authentication.
 - Face detection saves/uploads no images or face templates. The camera indicator may
-  stay lit while the guard watches. Camera capture stops when you wake manually,
-  disable the feature, exit, or lock Windows. It does not operate on the locked
+  stay lit while the guard watches. With away auto-sleep off, camera capture stops
+  when you wake manually or disable face wake. Exit and Windows lock stop camera
+  monitoring in either mode. It does not operate on the locked
   sign-in screen or unlock Windows; use normal wake/Windows Hello there. The existing
   unlock handler then disables the guard. Camera/privacy/driver failures leave the
   hotkey working and are logged without opening a camera preview.
@@ -209,10 +212,43 @@ hotkey when you next leave.
 
 This is **face detection, not recognition or authentication**: any face, including
 a convincing image, may trigger wake. It neither replaces Windows Hello nor
-unlocks Windows. No camera frames or face templates are saved or uploaded. Camera
-use stops when the guard is disabled or the Windows session locks. Close other
+unlocks Windows. No camera frames or face templates are saved or uploaded. For
+face wake alone, camera use stops when the guard is disabled. With away auto-sleep
+enabled, the awake presence watcher can take over; locking Windows stops both. Close other
 camera apps if the webcam is busy; a camera/driver failure leaves the hotkey
 available but can prevent automatic face wake.
+
+## Automatic Away Sleep
+
+Starting in 1.2.0, enable **Auto Sleep After 15 Min Away** in the tray menu. The
+setting is saved locally as `auto_sleep_enabled`; it is off by default. The
+monitor hotkey remains `Ctrl+Alt+Shift+M` and always works independently.
+
+The existing monitor sleep guard is enabled only after a full 15-minute period
+with both fresh camera observations showing no face and no keyboard/mouse input.
+A detected face or input activity restarts the countdown. Camera read failures,
+stale frames, an unavailable input-idle reading, and locked/secure desktop state
+do not count toward absence. If the camera stops, automatic sleep is suspended;
+resolve the camera problem and toggle the option off/on to restart monitoring.
+
+Unlike face wake alone, this option uses the webcam while the session is unlocked
+and the guard is off. The camera indicator can stay on. No frames are saved or
+uploaded: the isolated camera helper exchanges only a temporary current
+face-present boolean and monotonic timestamp, deleted when the helper closes.
+The activity check reads Windows' last-input time, not keys, mouse coordinates,
+window contents, or an input history.
+
+Manual wake starts a fresh observation period, preventing immediate auto-sleep.
+Locking Windows stops camera monitoring; unlocking restarts a fresh countdown.
+Turning the option off cancels pending auto-sleep but does not disable an already
+active guard; use the hotkey or **Wake Monitors** for that. **Wake on Face** remains
+a separate option: enable it too if you want returning to wake the monitors
+automatically. If it is off, use the monitor hotkey to cancel the guard and wake.
+
+This is a convenience mechanism, not proof of physical absence. Poor lighting,
+camera angle, virtual-camera selection, or a convincing face image can affect it.
+It does not lock, suspend, or power off the PC. Monitor sleep after app recovery
+still starts disabled; when auto-sleep is enabled its countdown begins again.
 
 ## Process Diagnostics
 

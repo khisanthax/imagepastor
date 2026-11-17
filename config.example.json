@@ -24,6 +24,7 @@
   "monitor_sleep_delay_ms": 750,
   "monitor_sleep_guard_interval_seconds": 15,
   "face_wake_enabled": false,
+  "auto_sleep_enabled": false,
   "face_wake_camera_index": 0,
   "save_captures": false,
   "capture_directory": "captures",
