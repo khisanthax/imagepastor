@@ -95,6 +95,9 @@ class ChatGptAddressTests(unittest.TestCase):
             def parent(self):
                 return self._parent
 
+            def get_value(self):
+                return "https://chatgpt.com/c/" + self.element_info.name.replace(" ", "-")
+
             def is_visible(self):
                 return True
 
@@ -125,8 +128,19 @@ class ChatGptAddressTests(unittest.TestCase):
 
 class MonitorControlTests(unittest.TestCase):
     def setUp(self):
+        execution_state = patch.object(
+            imagepastor.kernel32, "SetThreadExecutionState", return_value=1
+        )
+        self.execution_state = execution_state.start()
+        self.addCleanup(execution_state.stop)
         imagepastor.monitor_sleep_guard_enabled = False
         imagepastor.monitor_sleep_guard_cancel_event = None
+        imagepastor.monitor_sleep_once_cancel_event = None
+        imagepastor.monitor_power_generation = 0
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_ON
+        imagepastor.monitor_power_pending = None
+        imagepastor.monitor_display_state = None
+        imagepastor.monitor_wake_until = 0.0
 
     def tearDown(self):
         imagepastor.monitor_sleep_guard_enabled = False
@@ -134,6 +148,8 @@ class MonitorControlTests(unittest.TestCase):
         imagepastor.monitor_sleep_guard_cancel_event = None
         if event is not None:
             event.set()
+        if imagepastor.monitor_sleep_once_cancel_event is not None:
+            imagepastor.monitor_sleep_once_cancel_event.set()
 
     def test_hidden_control_window_lifecycle(self):
         imagepastor.configure_win32_signatures()
@@ -172,6 +188,128 @@ class MonitorControlTests(unittest.TestCase):
             [imagepastor.MONITOR_POWER_OFF, imagepastor.MONITOR_POWER_ON],
         )
         self.assertTrue(cancel_event.is_set())
+
+    def test_cancelled_queued_off_is_discarded_at_execution(self):
+        imagepastor.monitor_power_generation = 2
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_ON
+        with patch.object(imagepastor.user32, "DefWindowProcW") as power_call:
+            imagepastor.apply_monitor_power(123, 1, imagepastor.MONITOR_POWER_OFF)
+            power_call.assert_not_called()
+
+    def test_already_off_display_is_not_power_cycled_again(self):
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_OFF
+        imagepastor.monitor_display_state = 0
+        with patch.object(imagepastor.user32, "DefWindowProcW") as power_call:
+            imagepastor.apply_monitor_power(123, 0, imagepastor.MONITOR_POWER_OFF)
+            power_call.assert_not_called()
+
+    def test_extra_hotkey_presses_during_wake_cannot_enable_guard(self):
+        imagepastor.monitor_sleep_guard_enabled = True
+        imagepastor.monitor_sleep_guard_cancel_event = threading.Event()
+        with patch.object(imagepastor, "post_monitor_power") as post_power:
+            with patch.object(imagepastor.time, "monotonic", return_value=100.0):
+                imagepastor.toggle_monitor_sleep_guard({})
+                for _ in range(5):
+                    imagepastor.toggle_monitor_sleep_guard({})
+        self.assertFalse(imagepastor.monitor_sleep_guard_enabled)
+        post_power.assert_called_once_with(imagepastor.MONITOR_POWER_ON)
+        self.execution_state.assert_called_once_with(
+            imagepastor.ES_SYSTEM_REQUIRED | imagepastor.ES_DISPLAY_REQUIRED
+        )
+
+    def test_wake_cancels_delayed_one_shot_sleep_even_with_guard_disabled(self):
+        cancel_event = threading.Event()
+        imagepastor.monitor_sleep_once_cancel_event = cancel_event
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_OFF
+        with patch.object(imagepastor, "post_monitor_power") as post_power:
+            imagepastor.toggle_monitor_sleep_guard({})
+            self.assertFalse(imagepastor.sleep_monitors(0, cancel_event, 0))
+        post_power.assert_called_once_with(imagepastor.MONITOR_POWER_ON)
+        self.assertTrue(cancel_event.is_set())
+        self.assertFalse(imagepastor.monitor_sleep_guard_enabled)
+
+    def test_duplicate_off_commands_are_coalesced(self):
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_OFF
+        with patch.object(imagepastor, "monitor_control_hwnd", 123):
+            with patch.object(imagepastor.user32, "IsWindow", return_value=True):
+                with patch.object(imagepastor.user32, "PostMessageW", return_value=True) as queue:
+                    for _ in range(10):
+                        self.assertTrue(imagepastor.post_monitor_power(imagepastor.MONITOR_POWER_OFF))
+        queue.assert_called_once()
+
+    def test_unlock_stops_guard_instead_of_turning_display_off_again(self):
+        cancel_event = threading.Event()
+        imagepastor.monitor_sleep_guard_enabled = True
+        imagepastor.monitor_sleep_guard_cancel_event = cancel_event
+        imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_OFF
+        with patch.object(imagepastor, "post_monitor_power") as post_power:
+            imagepastor.wake_monitors_after_unlock()
+        self.assertTrue(cancel_event.is_set())
+        self.assertFalse(imagepastor.monitor_sleep_guard_enabled)
+        post_power.assert_called_once_with(imagepastor.MONITOR_POWER_ON)
+
+    def test_unlock_with_monitors_already_awake_has_no_power_command(self):
+        with patch.object(imagepastor, "post_monitor_power") as post_power:
+            imagepastor.wake_monitors_after_unlock()
+        post_power.assert_not_called()
+
+    def test_wake_requests_display_awake_and_releases_it_after_grace(self):
+        with patch.object(imagepastor.user32, "DefWindowProcW") as power_call:
+            with patch.object(imagepastor.user32, "SetTimer", return_value=1):
+                with patch.object(imagepastor.user32, "KillTimer") as kill_timer:
+                    with patch.object(imagepastor.kernel32, "SetThreadExecutionState", return_value=1) as awake:
+                        with patch.object(imagepastor.time, "monotonic", return_value=100.0):
+                            imagepastor.monitor_display_state = 1
+                            imagepastor.apply_monitor_power(123, 0, imagepastor.MONITOR_POWER_ON)
+                            imagepastor.finish_monitor_wake(123)
+                            kill_timer.assert_not_called()
+                        with patch.object(imagepastor.time, "monotonic", return_value=111.0):
+                            imagepastor.finish_monitor_wake(123)
+        self.assertEqual(
+            [call.args[0] for call in awake.call_args_list],
+            [imagepastor.ES_CONTINUOUS | imagepastor.ES_SYSTEM_REQUIRED | imagepastor.ES_DISPLAY_REQUIRED,
+             imagepastor.ES_CONTINUOUS],
+        )
+        power_call.assert_called_once_with(
+            123, imagepastor.WM_SYSCOMMAND, imagepastor.SC_MONITORPOWER, imagepastor.MONITOR_POWER_ON
+        )
+        kill_timer.assert_called_once()
+
+    def test_slow_power_driver_does_not_block_wake_request(self):
+        entered = threading.Event()
+        release = threading.Event()
+        woke = threading.Event()
+        original = imagepastor.user32.DefWindowProcW
+
+        def slow_power_call(hwnd, message, wparam, lparam):
+            if message == imagepastor.WM_SYSCOMMAND and wparam == imagepastor.SC_MONITORPOWER:
+                if lparam == imagepastor.MONITOR_POWER_OFF:
+                    entered.set()
+                    release.wait(3.0)
+                else:
+                    woke.set()
+                return 0
+            return original(hwnd, message, wparam, lparam)
+
+        imagepastor.configure_win32_signatures()
+        with patch.object(imagepastor.user32, "DefWindowProcW", side_effect=slow_power_call):
+            with patch.object(imagepastor.kernel32, "SetThreadExecutionState", return_value=1):
+                imagepastor.start_monitor_control_thread()
+                try:
+                    # Force the test off path without touching the real monitor power state.
+                    imagepastor.monitor_display_state = None
+                    imagepastor.monitor_power_desired = imagepastor.MONITOR_POWER_OFF
+                    self.assertTrue(imagepastor.post_monitor_power(imagepastor.MONITOR_POWER_OFF))
+                    self.assertTrue(entered.wait(2.0))
+                    imagepastor.set_monitor_sleep_guard(False, {})
+                    self.assertEqual(imagepastor.monitor_power_desired, imagepastor.MONITOR_POWER_ON)
+                    self.assertFalse(woke.is_set())
+                    release.set()
+                    self.assertTrue(woke.wait(2.0))
+                finally:
+                    release.set()
+                    imagepastor.stop_monitor_control_thread()
+                self.assertFalse(imagepastor.monitor_control_thread.is_alive())
 
 
 if __name__ == "__main__":

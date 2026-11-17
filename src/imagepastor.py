@@ -3,9 +3,11 @@ from __future__ import annotations
 import ctypes
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import winreg
 from ctypes import wintypes
@@ -14,6 +16,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from PIL import Image, ImageDraw, ImageGrab
+from face_wake import FaceWatcher, worker_main
+from runtime_diagnostics import RuntimeDiagnostics
+from lpha_autofill import AutofillAbort, WindowsBackend, fill as fill_lpha
 
 try:
     import pystray
@@ -21,13 +26,15 @@ except ImportError:
     pystray = None
 
 try:
-    from pywinauto import Application
+    from pywinauto import Application, Desktop
 except ImportError:
     Application = None
+    Desktop = None
 
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+wtsapi32 = ctypes.windll.wtsapi32
 
 try:
     shcore = ctypes.windll.shcore
@@ -43,9 +50,20 @@ MOD_NOREPEAT = 0x4000
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_TIMER = 0x0113
+WM_POWERBROADCAST = 0x0218
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_LOCK = 0x7
+WTS_SESSION_UNLOCK = 0x8
+PBT_POWERSETTINGCHANGE = 0x8013
+WM_MONITOR_POWER = 0x8001
 CAPTURE_HOTKEY_ID = 1
 TARGET_HOTKEY_ID = 2
 MONITOR_SLEEP_HOTKEY_ID = 3
+LPHA_HOTKEY_ID = 4
+LPHA_INSPECT_HOTKEY_ID = 5
+lpha_cancel = threading.Event()
+lpha_lock = threading.Lock()
 
 GA_ROOT = 2
 SW_RESTORE = 9
@@ -54,8 +72,14 @@ SC_MONITORPOWER = 0xF170
 MONITOR_POWER_ON = -1
 MONITOR_POWER_OFF = 2
 MONITOR_WINDOW_CLASS_NAME = "ImagePastorMonitorControlWindow"
+MONITOR_WAKE_TIMER_ID = 1
+MONITOR_WAKE_GRACE_SECONDS = 10.0
+SESSION_DISPLAY_GUID = (ctypes.c_ubyte * 16).from_buffer_copy(
+    bytes.fromhex("0ec2842b23addf4d93db05ffbd7efca5")
+)
 
 ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
 ES_CONTINUOUS = 0x80000000
 
 CF_DIB = 8
@@ -74,6 +98,7 @@ VK_MENU = 0x12
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 VK_V = 0x56
+diagnostics = None
 
 
 def app_dir() -> Path:
@@ -84,7 +109,10 @@ def app_dir() -> Path:
 
 def log(message: str) -> None:
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        pass
     try:
         with (app_dir() / "imagepastor.log").open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -177,17 +205,40 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
+class POWERBROADCAST_SETTING(ctypes.Structure):
+    _fields_ = [
+        ("PowerSetting", ctypes.c_ubyte * 16),
+        ("DataLength", wintypes.DWORD),
+        ("Data", ctypes.c_ubyte * 1),
+    ]
+
+
 paste_target_hwnd: int | None = None
 paste_target_composer_title: str | None = None
+paste_target_composer_url: str | None = None
+paste_target_document_id: tuple | None = None
 app_enabled = True
 monitor_sleep_guard_enabled = False
 monitor_sleep_guard_lock = threading.RLock()
 monitor_sleep_guard_cancel_event: threading.Event | None = None
+monitor_sleep_once_cancel_event: threading.Event | None = None
+monitor_power_generation = 0
+monitor_power_desired = MONITOR_POWER_ON
+monitor_power_pending: tuple[int, int] | None = None
+monitor_display_state: int | None = None
+monitor_wake_until = 0.0
 monitor_control_hwnd: int | None = None
 monitor_window_hinstance: int | None = None
+monitor_notification_handle: int | None = None
+monitor_session_notifications = False
+monitor_control_thread: threading.Thread | None = None
+monitor_control_thread_id = 0
 hotkey_thread_id = 0
 tray_icon = None
 active_config: dict | None = None
+face_watcher = FaceWatcher()
+face_wake_cancel: threading.Event | None = None
+face_wake_session_locked = False
 STARTUP_APP_NAME = "ImagePastor"
 STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CHROME_APP_PATHS_KEY = r"Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
@@ -256,6 +307,31 @@ def open_chime_extension_setup(_icon=None, _item=None) -> None:
 
 @WNDPROC
 def monitor_control_window_proc(hwnd, message, wparam, lparam):
+    global face_wake_session_locked
+    if message == WM_WTSSESSION_CHANGE:
+        if wparam in (WTS_SESSION_LOCK, WTS_SESSION_UNLOCK):
+            label = "unlocked" if wparam == WTS_SESSION_UNLOCK else "locked"
+            log(f"Windows session {label}.")
+        if wparam == WTS_SESSION_LOCK:
+            with monitor_sleep_guard_lock:
+                face_wake_session_locked = True
+                stop_face_wake()
+        if wparam == WTS_SESSION_UNLOCK:
+            face_wake_session_locked = False
+            wake_monitors_after_unlock()
+        return 0
+    if message == WM_MONITOR_POWER:
+        apply_monitor_power(hwnd, int(wparam), int(lparam))
+        return 0
+    if message == WM_TIMER and wparam == MONITOR_WAKE_TIMER_ID:
+        finish_monitor_wake(hwnd)
+        return 0
+    if message == WM_POWERBROADCAST and wparam == PBT_POWERSETTINGCHANGE and lparam:
+        setting = ctypes.cast(lparam, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
+        if bytes(setting.PowerSetting) == bytes(SESSION_DISPLAY_GUID) and setting.DataLength == 4:
+            state = wintypes.DWORD.from_address(lparam + POWERBROADCAST_SETTING.Data.offset).value
+            record_monitor_display_state(state)
+        return 1
     return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
 
@@ -335,6 +411,18 @@ def configure_win32_signatures() -> None:
     user32.TranslateMessage.restype = wintypes.BOOL
     user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
     user32.DispatchMessageW.restype = wintypes.LPARAM
+    user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID]
+    user32.SetTimer.restype = ctypes.c_size_t
+    user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+    user32.KillTimer.restype = wintypes.BOOL
+    user32.RegisterPowerSettingNotification.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD]
+    user32.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+    user32.UnregisterPowerSettingNotification.argtypes = [wintypes.HANDLE]
+    user32.UnregisterPowerSettingNotification.restype = wintypes.BOOL
+    wtsapi32.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+    wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+    wtsapi32.WTSUnRegisterSessionNotification.argtypes = [wintypes.HWND]
+    wtsapi32.WTSUnRegisterSessionNotification.restype = wintypes.BOOL
     user32.OpenClipboard.argtypes = [wintypes.HWND]
     user32.OpenClipboard.restype = wintypes.BOOL
     user32.EmptyClipboard.argtypes = []
@@ -366,6 +454,8 @@ def configure_win32_signatures() -> None:
 def create_monitor_control_window() -> int:
     global monitor_control_hwnd
     global monitor_window_hinstance
+    global monitor_notification_handle
+    global monitor_session_notifications
 
     hinstance = kernel32.GetModuleHandleW(None)
     if not hinstance:
@@ -398,21 +488,85 @@ def create_monitor_control_window() -> int:
 
     monitor_control_hwnd = hwnd
     monitor_window_hinstance = hinstance
+    monitor_notification_handle = user32.RegisterPowerSettingNotification(
+        hwnd, ctypes.byref(SESSION_DISPLAY_GUID), 0
+    )
+    if not monitor_notification_handle:
+        log("Display state notifications unavailable; monitor guard will use periodic checks.")
+    monitor_session_notifications = bool(wtsapi32.WTSRegisterSessionNotification(hwnd, 0))
+    if not monitor_session_notifications:
+        log("Session notifications unavailable; use the monitor hotkey after unlocking Windows.")
     return hwnd
 
 
 def destroy_monitor_control_window() -> None:
     global monitor_control_hwnd
     global monitor_window_hinstance
+    global monitor_notification_handle
+    global monitor_session_notifications
 
     hwnd = monitor_control_hwnd
     hinstance = monitor_window_hinstance
     monitor_control_hwnd = None
     monitor_window_hinstance = None
+    if monitor_notification_handle:
+        user32.UnregisterPowerSettingNotification(monitor_notification_handle)
+        monitor_notification_handle = None
+    if monitor_session_notifications and hwnd:
+        wtsapi32.WTSUnRegisterSessionNotification(hwnd)
+        monitor_session_notifications = False
     if hwnd:
         user32.DestroyWindow(hwnd)
     if hinstance:
         user32.UnregisterClassW(MONITOR_WINDOW_CLASS_NAME, hinstance)
+
+
+def run_monitor_control(ready: threading.Event, errors: list[Exception]) -> None:
+    global monitor_control_thread_id
+    try:
+        monitor_control_thread_id = kernel32.GetCurrentThreadId()
+        create_monitor_control_window()
+        ready.set()
+        msg = MSG()
+        while True:
+            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if result == -1:
+                raise ctypes.WinError()
+            if result == 0:
+                return
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except Exception as exc:
+        errors.append(exc)
+        log(f"Monitor control error: {exc}")
+    finally:
+        ready.set()
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        destroy_monitor_control_window()
+        monitor_control_thread_id = 0
+
+
+def start_monitor_control_thread() -> None:
+    global monitor_control_thread
+    ready = threading.Event()
+    errors: list[Exception] = []
+    monitor_control_thread = threading.Thread(
+        target=run_monitor_control, args=(ready, errors), daemon=True,
+        name="ImagePastorMonitorControl",
+    )
+    monitor_control_thread.start()
+    if not ready.wait(5.0):
+        raise RuntimeError("Monitor control thread did not start within five seconds.")
+    if errors:
+        raise RuntimeError(f"Could not start monitor control: {errors[0]}")
+    log(f"Monitor power controller started on thread {monitor_control_thread_id}.")
+
+
+def stop_monitor_control_thread() -> None:
+    if monitor_control_thread_id:
+        user32.PostThreadMessageW(monitor_control_thread_id, WM_QUIT, 0, 0)
+    if monitor_control_thread:
+        monitor_control_thread.join(timeout=3.0)
 
 
 def set_dpi_awareness() -> None:
@@ -433,13 +587,20 @@ def load_config() -> dict:
         "hotkey": {"modifiers": ["ctrl", "alt"], "key": "v"},
         "target_hotkey": {"modifiers": ["ctrl", "alt", "shift"], "key": "v"},
         "monitor_sleep_hotkey": {"modifiers": ["ctrl", "alt", "shift"], "key": "m"},
+        "lpha_hotkey": {"modifiers": ["ctrl", "alt"], "key": "l"},
+        "lpha_inspect_hotkey": {"modifiers": ["ctrl", "alt", "shift"], "key": "l"},
+        "lpha_show_menu": True,
+        "lpha_labels": {},
         "chatgpt_allowed_hosts": ["chatgpt.com", "chat.openai.com"],
         "auto_click_composer": True,
         "composer_click_offset_from_bottom": 90,
         "restore_mouse_position": True,
+        "capture_vivaldi_tile": True,
         "paste_delay_ms": 250,
         "monitor_sleep_delay_ms": 750,
         "monitor_sleep_guard_interval_seconds": 15,
+        "face_wake_enabled": False,
+        "face_wake_camera_index": 0,
         "save_captures": False,
         "capture_directory": "captures",
         "start_enabled": True,
@@ -461,6 +622,10 @@ def load_config() -> dict:
                 **{"modifiers": ["ctrl", "alt", "shift"], "key": "m"},
                 **user_config["monitor_sleep_hotkey"],
             }
+        base["lpha_hotkey"] = {**{"modifiers": ["ctrl", "alt"], "key": "l"},
+                               **user_config.get("lpha_hotkey", {})}
+        base["lpha_inspect_hotkey"] = {**{"modifiers": ["ctrl", "alt", "shift"], "key": "l"},
+                                       **user_config.get("lpha_inspect_hotkey", {})}
     return base
 
 
@@ -541,7 +706,7 @@ def hotkey_virtual_keys(hotkey: dict) -> list[int]:
 
 def wait_for_hotkey_release(hotkey: dict, timeout_seconds: float = 2.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
-    keys = hotkey_virtual_keys(hotkey)
+    keys = set(hotkey_virtual_keys(hotkey)) | {VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN}
     while time.monotonic() < deadline:
         if not any(user32.GetAsyncKeyState(key) & 0x8000 for key in keys):
             return True
@@ -565,8 +730,8 @@ def window_text(hwnd: int) -> str:
     return buffer.value
 
 
-def hovered_root_window() -> int:
-    point = get_cursor_pos()
+def hovered_root_window(point=None) -> int:
+    point = point if point is not None else get_cursor_pos()
     hwnd = user32.WindowFromPoint(point)
     if not hwnd:
         raise RuntimeError("No window found under cursor")
@@ -584,8 +749,13 @@ def window_rect(hwnd: int) -> tuple[int, int, int, int]:
 
 
 def capture_window_under_cursor(config: dict):
-    hwnd = hovered_root_window()
+    point = get_cursor_pos()
+    hwnd = hovered_root_window(point)
     bbox = window_rect(hwnd)
+    if (config.get("capture_vivaldi_tile", True) and is_valid_chromium_window(hwnd)
+            and window_text(hwnd).casefold().endswith(" - vivaldi")):
+        bbox = vivaldi_tile_rect(point, bbox)
+        log(f"Capturing Vivaldi tile region: {bbox[2] - bbox[0]}x{bbox[3] - bbox[1]}.")
     image = ImageGrab.grab(bbox=bbox, all_screens=True)
     title = window_text(hwnd) or f"HWND {hwnd}"
 
@@ -750,95 +920,160 @@ def composer_document_title(control) -> str:
     return ""
 
 
-def find_chatgpt_composer(window, document_title: str = ""):
+def document_value_urls(document):
+    for reader in (lambda: document.iface_value.CurrentValue,
+                   lambda: document.get_value(),
+                   lambda: document.legacy_properties().get("Value", "")):
+        try:
+            value = reader()
+            if isinstance(value, str) and value:
+                yield value
+        except Exception:
+            continue
+
+
+def vivaldi_tile_rect(point, window_bounds):
+    if Desktop is None:
+        raise RuntimeError("Cannot identify the Vivaldi tile; capture cancelled.")
+    ancestor = Desktop(backend="uia").from_point(point.x, point.y)
+    page = None
+    for _depth in range(64):
+        try:
+            if ancestor.element_info.control_type == "Document" and any(
+                    urlparse(value).scheme.lower() in {"http", "https", "file"}
+                    for value in document_value_urls(ancestor)):
+                page = ancestor  # Outermost web page, not a nested iframe or Vivaldi's chrome-extension UI.
+            ancestor = ancestor.parent()
+            if ancestor is None:
+                break
+        except Exception:
+            raise RuntimeError("Could not establish the Vivaldi page ancestry; capture cancelled.") from None
+    if page is None:
+        raise RuntimeError("Point inside the web page of the desired Vivaldi tile; capture cancelled.")
+    rect = page.rectangle()
+    left, top, right, bottom = window_bounds
+    bounds = max(left, rect.left), max(top, rect.top), min(right, rect.right), min(bottom, rect.bottom)
+    if not (bounds[0] <= point.x < bounds[2] and bounds[1] <= point.y < bounds[3]):
+        raise RuntimeError("Vivaldi tile bounds are unavailable; capture cancelled.")
+    return bounds
+
+
+def chatgpt_composer_document(control, allowed_hosts):
+    ancestor = control
+    for _depth in range(16):
+        try:
+            if ancestor.element_info.control_type == "Document":
+                for value in document_value_urls(ancestor):
+                    if host_is_allowed(url_host(value), allowed_hosts):
+                        return ancestor, value
+        except Exception:
+            pass
+        try:
+            ancestor = ancestor.parent()
+        except Exception:
+            break
+    return None, ""
+
+
+def document_runtime_id(document):
+    try:
+        value = document.element_info.runtime_id
+        if value and isinstance(value, (tuple, list)) and all(type(item) is int for item in value):
+            return tuple(value)
+    except Exception:
+        pass
+    return None
+
+
+def find_chatgpt_composer(window, document_title: str = "", document_url: str = "",
+                          point=None, allowed_hosts=None, document_id=None, diagnostics=None):
+    if allowed_hosts is None:
+        allowed_hosts = ["chatgpt.com", "chat.openai.com"]
     try:
         controls = window.descendants(control_type="Edit")
     except Exception:
         return None
 
     candidates = []
+    recognized = 0
     for control in controls:
         try:
             if (
-                control.element_info.name != "Chat with ChatGPT"
+                control.element_info.name not in {"Chat with ChatGPT", "Ask ChatGPT"}
                 or not control.is_visible()
                 or not control.is_enabled()
             ):
                 continue
-            candidates.append((control, composer_document_title(control)))
+            recognized += 1
+            document, url = chatgpt_composer_document(control, allowed_hosts)
+            if document is not None:
+                candidates.append((control, document.element_info.name.strip(), url, document))
         except Exception:
             continue
+    if diagnostics is not None:
+        diagnostics.update(edit_controls=len(controls), recognized_editors=recognized, verified_editors=len(candidates))
 
-    if document_title:
-        normalized_target = document_title.casefold()
-        for control, title in candidates:
-            if title.casefold() == normalized_target:
-                return control
+    if document_title or document_url or document_id:
+        exact = [control for control, title, url, document in candidates
+                 if (not document_title or title.casefold() == document_title.casefold())
+                 and (not document_url or url == document_url)
+                 and (not document_id or document_runtime_id(document) == document_id)]
+        return exact[0] if len(exact) == 1 else None
+
+    if point is not None:
+        hovered = []
+        for control, _title, _url, document in candidates:
+            try:
+                rect = document.rectangle()
+                if rect.left <= point.x < rect.right and rect.top <= point.y < rect.bottom:
+                    hovered.append(control)
+            except Exception:
+                continue
+        return hovered[0] if len(hovered) == 1 else None
 
     active_title = selected_tab_title(window)
     if active_title:
         normalized_active = active_title.casefold()
-        for control, title in candidates:
-            if title.casefold() == normalized_active:
-                return control
+        active = [control for control, title, _url, _document in candidates if title.casefold() == normalized_active]
+        if len(active) == 1:
+            return active[0]
 
     if len(candidates) == 1:
         return candidates[0][0]
     return None
 
 
+def composer_under_pointer(window, point, allowed_hosts, diagnostics):
+    if Desktop is not None:
+        try:
+            hit = Desktop(backend="uia").from_point(point.x, point.y)
+            document, url = chatgpt_composer_document(hit, allowed_hosts)
+            diagnostics["pointer_document_verified"] = document is not None
+            if document is not None:
+                return find_chatgpt_composer(window, document_url=url, allowed_hosts=allowed_hosts,
+                                             document_id=document_runtime_id(document), diagnostics=diagnostics)
+        except Exception:
+            diagnostics["pointer_hit_test_failed"] = True
+    return find_chatgpt_composer(window, point=point, allowed_hosts=allowed_hosts, diagnostics=diagnostics)
+
+
 def paste_target_is_available(hwnd: int, allowed_hosts: list[str]) -> bool:
     window = chromium_window_wrapper(hwnd)
     if window is None:
         return False
-    if paste_target_composer_title and find_chatgpt_composer(window, paste_target_composer_title):
-        return True
+    if paste_target_composer_title or paste_target_composer_url:
+        return find_chatgpt_composer(window, paste_target_composer_title, paste_target_composer_url,
+                                     allowed_hosts=allowed_hosts, document_id=paste_target_document_id) is not None
     return chromium_window_has_allowed_address(window, allowed_hosts)
 
 
-def ensure_chatgpt_tab(hwnd: int, allowed_hosts: list[str], scan_tabs: bool = True) -> bool:
+def ensure_chatgpt_tab(hwnd: int, allowed_hosts: list[str], scan_tabs: bool = False) -> bool:
     window = chromium_window_wrapper(hwnd)
     if window is None:
         return False
 
-    if chromium_window_has_allowed_address(window, allowed_hosts):
-        return True
-    if not scan_tabs:
-        return False
-
-    try:
-        tabs = window.descendants(control_type="TabItem")
-    except Exception as exc:
-        log(f"Could not inspect Chromium tabs for '{window_text(hwnd)}': {exc}")
-        return False
-
-    original_tab = None
-    for tab in tabs:
-        try:
-            if tab.is_selected():
-                original_tab = tab
-                break
-        except Exception:
-            continue
-
-    for tab in tabs:
-        try:
-            if tab is original_tab:
-                continue
-            tab.select()
-            time.sleep(0.08)
-            if chromium_window_has_allowed_address(window, allowed_hosts):
-                log(f"Selected a ChatGPT tab in '{window_text(hwnd)}'.")
-                return True
-        except Exception:
-            continue
-
-    if original_tab is not None:
-        try:
-            original_tab.select()
-        except Exception:
-            pass
-    return False
+    # scan_tabs is retained for call compatibility, but target lookup never selects tabs.
+    return chromium_window_has_allowed_address(window, allowed_hosts)
 
 
 def find_chatgpt_chromium_tab(allowed_hosts: list[str]) -> int | None:
@@ -848,13 +1083,10 @@ def find_chatgpt_chromium_tab(allowed_hosts: list[str]) -> int | None:
         if is_valid_chromium_window(hwnd)
     ]
 
-    for hwnd, _title in chromium_windows:
-        if ensure_chatgpt_tab(hwnd, allowed_hosts):
-            return hwnd
-
-    if chromium_windows:
-        titles = "; ".join(title for _hwnd, title in chromium_windows)
-        log(f"Inspected Chromium windows but found no ChatGPT URL. Windows: {titles}")
+    matches = [hwnd for hwnd, _title in chromium_windows if ensure_chatgpt_tab(hwnd, allowed_hosts, scan_tabs=False)]
+    if len(matches) == 1:
+        return matches[0]
+    log("No unique currently-open ChatGPT window; select a tile with the target hotkey. No tabs were changed.")
     return None
 
 
@@ -867,8 +1099,8 @@ def resolve_chatgpt_window(config: dict) -> int | None:
     if paste_target_hwnd:
         if paste_target_is_available(paste_target_hwnd, config["chatgpt_allowed_hosts"]):
             return paste_target_hwnd
-        log("Saved paste target is no longer a valid Chromium window with a ChatGPT tab.")
-        paste_target_hwnd = None
+        log("Saved ChatGPT tile is unavailable or ambiguous; reselect it with the target hotkey. Paste cancelled.")
+        return None
     return find_chatgpt_window(config)
 
 
@@ -914,6 +1146,11 @@ def left_click(x: int, y: int) -> None:
         raise ctypes.WinError()
 
 
+def input_modifiers_down() -> bool:
+    return any(user32.GetAsyncKeyState(key) & 0x8000
+               for key in (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN))
+
+
 def paste_into_chatgpt(config: dict) -> bool:
     hwnd = resolve_chatgpt_window(config)
     if not hwnd:
@@ -931,35 +1168,33 @@ def paste_into_chatgpt(config: dict) -> bool:
             log(f"{reason}; paste cancelled.")
             return False
         window = chromium_window_wrapper(hwnd)
-        composer = find_chatgpt_composer(window, paste_target_composer_title) if window else None
-        if composer is None and not ensure_chatgpt_tab(
-            hwnd, config["chatgpt_allowed_hosts"], scan_tabs=False
-        ):
-            log("The active browser tab is not ChatGPT; paste cancelled.")
+        composer = find_chatgpt_composer(window, paste_target_composer_title, paste_target_composer_url,
+                                         allowed_hosts=config["chatgpt_allowed_hosts"],
+                                         document_id=paste_target_document_id) if window else None
+        if composer is None:
+            log("No unique verified ChatGPT composer; paste cancelled. Select the desired tile again.")
             return False
 
-        if composer is not None:
-            rect = composer.rectangle()
-            composer_title = composer_document_title(composer) or "selected ChatGPT tile"
-            log(f"Focusing ChatGPT composer '{composer_title}' for paste.")
-            left_click(
-                rect.left + ((rect.right - rect.left) // 2),
-                rect.top + ((rect.bottom - rect.top) // 2),
-            )
-        elif config["auto_click_composer"]:
-            left, top, right, bottom = window_rect(hwnd)
-            click_x = left + ((right - left) // 2)
-            click_y = bottom - int(config["composer_click_offset_from_bottom"])
-            left_click(click_x, click_y)
-            time.sleep(0.1)
+        document, document_url = chatgpt_composer_document(composer, config["chatgpt_allowed_hosts"])
+        if document is None:
+            return False
+        document_title = document.element_info.name.strip()
+        document_id = document_runtime_id(document)
+        rect = composer.rectangle()
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return False
+        if input_modifiers_down():
+            log("Modifier key still held; automatic click/paste cancelled.")
+            return False
+        log("Focusing the verified ChatGPT tile composer for paste.")
+        left_click(rect.left + ((rect.right - rect.left) // 2), rect.top + ((rect.bottom - rect.top) // 2))
+        time.sleep(0.1)
 
         foreground = user32.GetAncestor(user32.GetForegroundWindow(), GA_ROOT)
-        target_still_available = (
-            find_chatgpt_composer(window, paste_target_composer_title) is not None
-            if composer is not None
-            else ensure_chatgpt_tab(hwnd, config["chatgpt_allowed_hosts"], scan_tabs=False)
-        )
-        if foreground != hwnd or not target_still_available:
+        current = find_chatgpt_composer(window, document_title, document_url,
+                                       allowed_hosts=config["chatgpt_allowed_hosts"], document_id=document_id)
+        target_still_available = current is not None and current.has_keyboard_focus()
+        if foreground != hwnd or not target_still_available or input_modifiers_down():
             log("ChatGPT lost focus or changed tabs before paste; paste cancelled.")
             return False
 
@@ -973,21 +1208,38 @@ def paste_into_chatgpt(config: dict) -> bool:
 def set_paste_target(config: dict) -> None:
     global paste_target_hwnd
     global paste_target_composer_title
-    hwnd = user32.GetForegroundWindow()
+    global paste_target_composer_url
+    global paste_target_document_id
+    point = get_cursor_pos()
+    hovered = user32.GetAncestor(user32.WindowFromPoint(point), GA_ROOT)
+    use_pointer = is_valid_chromium_window(hovered)
+    hwnd = hovered if use_pointer else user32.GetForegroundWindow()
     if not hwnd:
         log("Could not set paste target because there is no foreground window.")
         return
     hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
-    if not ensure_chatgpt_tab(hwnd, config["chatgpt_allowed_hosts"], scan_tabs=False):
-        log("Paste target was not changed because the active window is not a ChatGPT browser tab.")
+    window = chromium_window_wrapper(hwnd)
+    diagnostics = {}
+    composer = (composer_under_pointer(window, point, config["chatgpt_allowed_hosts"], diagnostics)
+                if use_pointer else find_chatgpt_composer(window, allowed_hosts=config["chatgpt_allowed_hosts"],
+                                                         diagnostics=diagnostics)) if window else None
+    if composer is None:
+        log(f"Paste target unchanged: no unique verified ChatGPT editor. Target diagnostics: {diagnostics}")
+        return
+    document, url = chatgpt_composer_document(composer, config["chatgpt_allowed_hosts"])
+    if document is None:
+        log("Paste target unchanged: ChatGPT document URL could not be verified.")
+        return
+    try:
+        title = document.element_info.name.strip()
+    except Exception:
+        log("Paste target unchanged: the ChatGPT document changed during selection.")
         return
     paste_target_hwnd = hwnd
-    window = chromium_window_wrapper(hwnd)
-    composer = find_chatgpt_composer(window) if window else None
-    paste_target_composer_title = composer_document_title(composer) if composer else None
-    if paste_target_composer_title:
-        log(f"Paste target composer set to '{paste_target_composer_title}'.")
-    log(f"Paste target set to '{window_text(hwnd) or f'HWND {hwnd}'}'.")
+    paste_target_composer_title = title
+    paste_target_composer_url = url
+    paste_target_document_id = document_runtime_id(document)
+    log("Paste target set to the verified ChatGPT tile. No text or image was pasted.")
 
 
 def create_tray_image(enabled: bool) -> Image.Image:
@@ -1021,15 +1273,81 @@ def tray_set_target(_icon=None, _item=None) -> None:
         set_paste_target(active_config)
 
 
-def post_monitor_power(state: int) -> bool:
-    hwnd = monitor_control_hwnd
-    if not hwnd or not user32.IsWindow(hwnd):
-        log("Monitor control window is unavailable.")
-        return False
-    if not user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, state):
-        log(f"Could not queue monitor power state {state}.")
-        return False
-    return True
+def record_monitor_display_state(state: int) -> None:
+    global monitor_display_state
+    with monitor_sleep_guard_lock:
+        monitor_display_state = state
+    label = {0: "off", 1: "on", 2: "dimmed"}.get(state, str(state))
+    log(f"Windows reports session display {label}.")
+
+
+def apply_monitor_power(hwnd: int, generation: int, state: int) -> None:
+    global monitor_power_pending
+    global monitor_wake_until
+    with monitor_sleep_guard_lock:
+        if monitor_power_pending == (generation, state):
+            monitor_power_pending = None
+        if generation != monitor_power_generation or state != monitor_power_desired:
+            log(f"Discarded cancelled monitor command: state={state}, generation={generation}.")
+            return
+        if state == MONITOR_POWER_OFF and monitor_display_state == 0:
+            return
+        if state == MONITOR_POWER_ON:
+            monitor_wake_until = max(
+                monitor_wake_until, time.monotonic() + MONITOR_WAKE_GRACE_SECONDS
+            )
+
+    # Driver calls must never hold the state lock or block the hotkey thread.
+    if state == MONITOR_POWER_ON:
+        flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        if not kernel32.SetThreadExecutionState(flags):
+            log("Could not request temporary display-awake protection.")
+        if not user32.SetTimer(hwnd, MONITOR_WAKE_TIMER_ID, 1000, None):
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            log("Could not schedule release of display-awake protection.")
+    else:
+        user32.KillTimer(hwnd, MONITOR_WAKE_TIMER_ID)
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    started = time.monotonic()
+    label = "on" if state == MONITOR_POWER_ON else "off"
+    log(f"Applying monitor power {label}, generation={generation}.")
+    user32.DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, state)
+    log(f"Monitor power {label} call returned in {time.monotonic() - started:.3f}s.")
+
+
+def finish_monitor_wake(hwnd: int) -> None:
+    with monitor_sleep_guard_lock:
+        keep_waking = time.monotonic() < monitor_wake_until
+        display_on = monitor_display_state == 1
+    if keep_waking:
+        if not display_on:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        return
+    user32.KillTimer(hwnd, MONITOR_WAKE_TIMER_ID)
+    kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    log("Monitor wake protection finished; normal Windows power policy restored.")
+
+
+def post_monitor_power(state: int, generation: int | None = None) -> bool:
+    global monitor_power_pending
+    with monitor_sleep_guard_lock:
+        if generation is None:
+            generation = monitor_power_generation
+        if generation != monitor_power_generation or state != monitor_power_desired:
+            return False
+        command = (generation, state)
+        if monitor_power_pending == command:
+            return True
+        hwnd = monitor_control_hwnd
+        if not hwnd or not user32.IsWindow(hwnd):
+            log("Monitor control window is unavailable.")
+            return False
+        monitor_power_pending = command
+        if not user32.PostMessageW(hwnd, WM_MONITOR_POWER, generation, state):
+            monitor_power_pending = None
+            log(f"Could not queue monitor power state {state}.")
+            return False
+        return True
 
 
 def post_guard_monitor_off(cancel_event: threading.Event) -> bool:
@@ -1043,13 +1361,13 @@ def post_guard_monitor_off(cancel_event: threading.Event) -> bool:
         return post_monitor_power(MONITOR_POWER_OFF)
 
 
-def sleep_monitors(delay_ms: int = 750, log_success: bool = True) -> bool:
-    time.sleep(max(0, delay_ms) / 1000)
-    if not post_monitor_power(MONITOR_POWER_OFF):
+def sleep_monitors(delay_ms: int, cancel_event: threading.Event, generation: int) -> bool:
+    if cancel_event.wait(max(0, delay_ms) / 1000):
         return False
-    if log_success:
+    if post_monitor_power(MONITOR_POWER_OFF, generation):
         log("Monitor sleep command queued.")
-    return True
+        return True
+    return False
 
 
 def monitor_sleep_guard(config: dict, cancel_event: threading.Event) -> None:
@@ -1081,11 +1399,20 @@ def monitor_sleep_guard(config: dict, cancel_event: threading.Event) -> None:
 def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
     global monitor_sleep_guard_enabled
     global monitor_sleep_guard_cancel_event
+    global monitor_sleep_once_cancel_event
+    global monitor_power_generation
+    global monitor_power_desired
+    global monitor_wake_until
 
     worker = None
     with monitor_sleep_guard_lock:
-        if monitor_sleep_guard_enabled == enabled:
+        if enabled and monitor_sleep_guard_enabled:
             return
+        monitor_power_generation += 1
+        monitor_power_desired = MONITOR_POWER_OFF if enabled else MONITOR_POWER_ON
+        if monitor_sleep_once_cancel_event is not None:
+            monitor_sleep_once_cancel_event.set()
+            monitor_sleep_once_cancel_event = None
         monitor_sleep_guard_enabled = enabled
         if enabled:
             cancel_event = threading.Event()
@@ -1097,6 +1424,8 @@ def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
                 name="ImagePastorMonitorGuard",
             )
         else:
+            stop_face_wake()
+            monitor_wake_until = time.monotonic() + MONITOR_WAKE_GRACE_SECONDS
             cancel_event = monitor_sleep_guard_cancel_event
             monitor_sleep_guard_cancel_event = None
             if cancel_event is not None:
@@ -1104,20 +1433,104 @@ def set_monitor_sleep_guard(enabled: bool, config: dict) -> None:
             post_monitor_power(MONITOR_POWER_ON)
 
     log(f"Monitor sleep guard {'enabled' if enabled else 'disabled'}.")
+    if not enabled:
+        # Reset idle timers immediately, even if a previous driver call has not returned.
+        if not kernel32.SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED):
+            log("Could not request immediate monitor wake.")
     if worker is not None:
         worker.start()
+        start_face_wake(config)
     update_tray_icon()
+
+
+def stop_face_wake() -> None:
+    global face_wake_cancel
+    with monitor_sleep_guard_lock:
+        if face_wake_cancel is not None:
+            face_wake_cancel.set()
+            face_wake_cancel = None
+
+
+def start_face_wake(config: dict) -> None:
+    global face_wake_cancel
+    with monitor_sleep_guard_lock:
+        stop_face_wake()
+        if (not config.get("face_wake_enabled", False) or not monitor_sleep_guard_enabled
+                or face_wake_session_locked):
+            return
+        guard = monitor_sleep_guard_cancel_event
+        cancel = threading.Event()
+        face_wake_cancel = cancel
+
+        def wake():
+            with monitor_sleep_guard_lock:
+                if (not cancel.is_set() and face_wake_cancel is cancel and monitor_sleep_guard_enabled
+                        and monitor_sleep_guard_cancel_event is guard):
+                    log("Sustained face detected; disabling monitor sleep guard and waking displays.")
+                    set_monitor_sleep_guard(False, config)
+
+        threading.Thread(target=face_watcher.run, args=(cancel, dict(config), wake, log),
+                         daemon=False, name="ImagePastorFaceWake").start()
+
+
+def toggle_face_wake(_icon=None, _item=None) -> None:
+    if active_config is None:
+        return
+    enabled = not active_config.get("face_wake_enabled", False)
+    temporary = None
+    try:
+        path = app_dir() / "config.json"
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        saved["face_wake_enabled"] = enabled
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         delete=False, suffix=".tmp") as handle:
+            temporary = Path(handle.name)
+            json.dump(saved, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        active_config["face_wake_enabled"] = enabled
+        if enabled:
+            start_face_wake(active_config)
+        else:
+            stop_face_wake()
+        log(f"Face wake {'enabled' if enabled else 'disabled'}.")
+        update_tray_icon()
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"Could not save face wake setting ({type(exc).__name__}).")
+        show_error("ImagePastor", "Could not save the face wake setting.")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def toggle_monitor_sleep_guard(config: dict) -> None:
     with monitor_sleep_guard_lock:
-        set_monitor_sleep_guard(not monitor_sleep_guard_enabled, config)
+        if not monitor_sleep_guard_enabled and time.monotonic() < monitor_wake_until:
+            log("Monitor hotkey repeated during wake; keeping monitors awake.")
+            return
+        wants_sleep = not monitor_sleep_guard_enabled and monitor_power_desired != MONITOR_POWER_OFF
+        set_monitor_sleep_guard(wants_sleep, config)
 
 
 def request_monitor_sleep(config: dict) -> None:
+    global monitor_sleep_once_cancel_event
+    global monitor_power_generation
+    global monitor_power_desired
+    with monitor_sleep_guard_lock:
+        if time.monotonic() < monitor_wake_until:
+            log("Monitor sleep request ignored while monitors are waking.")
+            return
+        if monitor_sleep_once_cancel_event is not None:
+            monitor_sleep_once_cancel_event.set()
+        cancel_event = threading.Event()
+        monitor_sleep_once_cancel_event = cancel_event
+        monitor_power_generation += 1
+        generation = monitor_power_generation
+        monitor_power_desired = MONITOR_POWER_OFF
     threading.Thread(
         target=sleep_monitors,
-        args=(int(config["monitor_sleep_delay_ms"]),),
+        args=(int(config["monitor_sleep_delay_ms"]), cancel_event, generation),
         daemon=True,
         name="ImagePastorMonitorSleepOnce",
     ).start()
@@ -1133,6 +1546,18 @@ def tray_toggle_monitor_sleep_guard(_icon=None, _item=None) -> None:
         toggle_monitor_sleep_guard(active_config)
 
 
+def tray_wake_monitors(_icon=None, _item=None) -> None:
+    if active_config is not None:
+        set_monitor_sleep_guard(False, active_config)
+
+
+def wake_monitors_after_unlock() -> None:
+    with monitor_sleep_guard_lock:
+        if monitor_sleep_guard_enabled or monitor_power_desired == MONITOR_POWER_OFF:
+            log("Unlocking Windows cancels monitor sleep and requests wake.")
+            set_monitor_sleep_guard(False, active_config or {})
+
+
 def toggle_startup(_icon=None, _item=None) -> None:
     try:
         set_startup_enabled(not startup_enabled())
@@ -1143,11 +1568,104 @@ def toggle_startup(_icon=None, _item=None) -> None:
 
 
 def tray_exit(icon=None, _item=None) -> None:
+    lpha_cancel.set()
     log("Exit requested from tray.")
     if icon:
         icon.stop()
     if hotkey_thread_id:
         user32.PostThreadMessageW(hotkey_thread_id, WM_QUIT, 0, 0)
+
+
+def start_lpha_autofill(_icon=None, _item=None, *, from_hotkey=False, inspect_only=False) -> None:
+    if active_config is not None and not active_config.get("lpha_enabled", True):
+        notify_lpha("LPHA Autofill is disabled in this installation's configuration.")
+        return
+    if not lpha_lock.acquire(blocking=False):
+        lpha_cancel.set()
+        log("LPHA Autofill: cancellation requested; any partial entries are preserved.")
+        return
+    lpha_cancel.clear()
+
+    def worker():
+        initialized = False
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            initialized = True
+            if not from_hotkey and lpha_cancel.wait(3):
+                raise AutofillAbort("CANCELLED")
+            hotkey_name = "lpha_inspect_hotkey" if inspect_only else "lpha_hotkey"
+            if not active_config or not wait_for_hotkey_release(active_config[hotkey_name]):
+                raise AutofillAbort("HOTKEY_HELD")
+            if monitor_sleep_guard_enabled:
+                raise AutofillAbort("MONITOR_GUARD_ACTIVE")
+            backend = WindowsBackend(user32, send_key, active_config.get("lpha_labels"))
+            if inspect_only:
+                snapshots = []
+                for _ in range(2):
+                    if lpha_cancel.is_set():
+                        raise AutofillAbort("CANCELLED")
+                    snapshots.append(backend.inspect_structure())
+                    if lpha_cancel.wait(0.25):
+                        raise AutofillAbort("CANCELLED")
+                log("LPHA read-only structure: " + json.dumps({"snapshots": snapshots}, sort_keys=True))
+                notify_lpha("Read-only field check complete. Counts saved in the log; no values read or input sent.")
+                return
+            result = fill_lpha(backend, lambda: lpha_cancel.is_set() or monitor_sleep_guard_enabled)
+            log(f"LPHA Autofill: {result}. Review manually; no Save, Send, or Sign was used.")
+            notify_lpha("Fields filled. Review manually; nothing was submitted or signed.")
+        except AutofillAbort as exc:
+            log(f"LPHA Autofill stopped: {exc.code}. Any partial entries are preserved; review manually.")
+            notify_lpha(f"Stopped: {exc.code}. Review any partial entries manually.")
+        except Exception:
+            # UIA exceptions can include patient names/values. Never log them.
+            log("LPHA Autofill stopped: ACCESSIBILITY_OR_INPUT_UNAVAILABLE. Review manually.")
+            notify_lpha("Stopped: accessibility or input unavailable. Review manually.")
+        finally:
+            if initialized:
+                pythoncom.CoUninitialize()
+            lpha_lock.release()
+
+    log("LPHA read-only check requested; no input will be sent." if inspect_only else
+        "LPHA Autofill requested. Escape or the hotkey again cancels; no automatic cleanup.")
+    threading.Thread(target=worker, name="lpha-autofill", daemon=True).start()
+
+
+def cancel_lpha_autofill(_icon=None, _item=None) -> None:
+    lpha_cancel.set()
+
+
+def notify_lpha(message: str) -> None:
+    if tray_icon:
+        try:
+            tray_icon.notify(message, "LPHA Autofill")
+        except Exception:
+            pass
+
+
+def register_lpha_hotkey(config: dict, *, inspect_only=False) -> bool:
+    if not config.get("lpha_enabled", True):
+        return False
+    try:
+        def signature(name):
+            hotkey = config[name]
+            return hotkey_modifiers(hotkey["modifiers"]), virtual_key(hotkey["key"])
+        name = "lpha_inspect_hotkey" if inspect_only else "lpha_hotkey"
+        identifier = LPHA_INSPECT_HOTKEY_ID if inspect_only else LPHA_HOTKEY_ID
+        desired = signature(name)
+        others = ["hotkey", "target_hotkey", "monitor_sleep_hotkey"]
+        if inspect_only:
+            others.append("lpha_hotkey")
+        if desired in {signature(other) for other in others}:
+            log("LPHA hotkey conflicts with an ImagePastor shortcut; LPHA hotkey disabled.")
+            return False
+        if user32.RegisterHotKey(None, identifier, *desired):
+            log("LPHA read-only hotkey registered." if inspect_only else "LPHA Autofill global hotkey registered.")
+            return True
+    except (KeyError, TypeError, ValueError, AttributeError):
+        pass
+    log("LPHA hotkey unavailable; existing shortcuts are unchanged. Use the tray menu or configure another combo.")
+    return False
 
 
 def run_tray() -> None:
@@ -1163,8 +1681,16 @@ def run_tray() -> None:
         menu=pystray.Menu(
             pystray.MenuItem("Enabled", toggle_enabled, checked=lambda _item: app_enabled),
             pystray.MenuItem("Set Current Window as Target", tray_set_target),
+            pystray.MenuItem("LPHA Autofill (3-second delay)", start_lpha_autofill,
+                             visible=lambda _item: bool(active_config and active_config.get("lpha_enabled", True)
+                                                        and active_config.get("lpha_show_menu", True))),
+            pystray.MenuItem("Cancel LPHA Autofill", cancel_lpha_autofill,
+                             enabled=lambda _item: lpha_lock.locked()),
             pystray.MenuItem("Keep Monitors Asleep", tray_toggle_monitor_sleep_guard, checked=lambda _item: monitor_sleep_guard_enabled),
             pystray.MenuItem("Sleep Monitors Once", tray_sleep_monitors),
+            pystray.MenuItem("Wake Monitors", tray_wake_monitors),
+            pystray.MenuItem("Wake on Face", toggle_face_wake,
+                             checked=lambda _item: bool(active_config and active_config.get("face_wake_enabled", False))),
             pystray.MenuItem("Set Up ChatGPT Chime", open_chime_extension_setup),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda _item: startup_enabled()),
             pystray.MenuItem("Exit", tray_exit),
@@ -1194,6 +1720,7 @@ def main() -> int:
     global app_enabled
     global hotkey_thread_id
     global active_config
+    global diagnostics
 
     configure_win32_signatures()
     mutex = kernel32.CreateMutexW(None, False, "ImagePastorSingleInstance")
@@ -1202,11 +1729,17 @@ def main() -> int:
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         raise RuntimeError("ImagePastor is already running.")
 
+    diagnostics = RuntimeDiagnostics(app_dir(), log)
+    try:
+        diagnostics.start()
+    except OSError as exc:
+        log(f"Process diagnostics unavailable: {type(exc).__name__}.")
+
     set_dpi_awareness()
     config = load_config()
     active_config = config
     app_enabled = bool(config["start_enabled"])
-    create_monitor_control_window()
+    start_monitor_control_thread()
 
     capture_modifiers = hotkey_modifiers(config["hotkey"]["modifiers"])
     capture_vk = virtual_key(config["hotkey"]["key"])
@@ -1226,6 +1759,9 @@ def main() -> int:
         user32.UnregisterHotKey(None, TARGET_HOTKEY_ID)
         user32.UnregisterHotKey(None, CAPTURE_HOTKEY_ID)
         raise RuntimeError(f"Could not register monitor sleep hotkey {combo}. Another app is already using it.")
+
+    lpha_available = register_lpha_hotkey(config)
+    lpha_inspect_available = register_lpha_hotkey(config, inspect_only=True)
 
     combo = "+".join([*config["hotkey"]["modifiers"], config["hotkey"]["key"]])
     target_combo = "+".join([*config["target_hotkey"]["modifiers"], config["target_hotkey"]["key"]])
@@ -1247,39 +1783,75 @@ def main() -> int:
             if message_result == -1:
                 raise ctypes.WinError()
             if message_result == 0:
+                log("Hotkey message loop received WM_QUIT.")
                 break
             if msg.message == WM_HOTKEY and msg.wParam == CAPTURE_HOTKEY_ID:
-                handle_hotkey(config)
+                if lpha_lock.locked():
+                    cancel_lpha_autofill()
+                    log("Capture skipped while LPHA Autofill cancels; retry after it stops.")
+                else:
+                    handle_hotkey(config)
             elif msg.message == WM_HOTKEY and msg.wParam == TARGET_HOTKEY_ID:
-                set_paste_target(config)
+                if lpha_lock.locked():
+                    cancel_lpha_autofill()
+                else:
+                    set_paste_target(config)
             elif msg.message == WM_HOTKEY and msg.wParam == MONITOR_SLEEP_HOTKEY_ID:
+                cancel_lpha_autofill()
                 toggle_monitor_sleep_guard(config)
+            elif msg.message == WM_HOTKEY and msg.wParam == LPHA_HOTKEY_ID:
+                start_lpha_autofill(from_hotkey=True)
+            elif msg.message == WM_HOTKEY and msg.wParam == LPHA_INSPECT_HOTKEY_ID:
+                start_lpha_autofill(from_hotkey=True, inspect_only=True)
             else:
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
     except KeyboardInterrupt:
         log("Exiting.")
     finally:
-        guard_was_enabled = monitor_sleep_guard_enabled
+        cancel_lpha_autofill()
         set_monitor_sleep_guard(False, config)
-        if guard_was_enabled and monitor_control_hwnd:
-            user32.DefWindowProcW(
-                monitor_control_hwnd,
-                WM_SYSCOMMAND,
-                SC_MONITORPOWER,
-                MONITOR_POWER_ON,
-            )
         user32.UnregisterHotKey(None, CAPTURE_HOTKEY_ID)
         user32.UnregisterHotKey(None, TARGET_HOTKEY_ID)
         user32.UnregisterHotKey(None, MONITOR_SLEEP_HOTKEY_ID)
-        destroy_monitor_control_window()
+        if lpha_available:
+            user32.UnregisterHotKey(None, LPHA_HOTKEY_ID)
+        if lpha_inspect_available:
+            user32.UnregisterHotKey(None, LPHA_INSPECT_HOTKEY_ID)
+        stop_monitor_control_thread()
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--face-wake-worker":
+        raise SystemExit(worker_main())
+    if "--app-worker" not in sys.argv:
+        from process_supervisor import supervise
+        configure_win32_signatures()
+        supervisor_mutex = kernel32.CreateMutexW(None, False, "ImagePastorSupervisor")
+        if not supervisor_mutex:
+            raise ctypes.WinError()
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            raise SystemExit(0)
+        command = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            command.append(str(Path(__file__).resolve()))
+        command.append("--app-worker")
+        raise SystemExit(supervise(command, app_dir()))
+    exit_status = "error"
     try:
-        raise SystemExit(main())
+        result = main()
+        exit_status = "clean"
+        raise SystemExit(result)
     except Exception as error:
+        if diagnostics:
+            diagnostics.report_exception("Fatal main exception", type(error), error.__traceback__)
         log(f"Fatal error: {error}")
         show_error("ImagePastor", f"Fatal error:\n\n{error}")
         raise
+    finally:
+        if diagnostics:
+            try:
+                diagnostics.finish(exit_status)
+            except OSError:
+                log("Could not persist process exit receipt.")
