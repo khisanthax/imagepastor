@@ -1,13 +1,33 @@
 # ImagePastor
 
-A small Windows hotkey utility for quickly sending a screenshot of the window under your mouse to ChatGPT in a browser.
+A Windows tray utility for screenshot-to-ChatGPT workflows, keeping monitors asleep
+while the PC continues working, optional local face-triggered wake, and completion
+chimes. Python is bundled in the installer; no OpenAI API key is required.
+
+## What It Does
+
+| Feature | Behavior |
+| --- | --- |
+| Screenshot and paste | Captures the visible window under the pointer and attaches the image to a verified ChatGPT browser composer. It does not send the message. |
+| Vivaldi tiles | Captures just the web page in the tile under the pointer and can pin a separate ChatGPT destination tile, including tiles with identical titles. |
+| Monitor sleep guard | Keeps Windows running for background work while repeatedly enforcing display-off when necessary. |
+| Optional face wake | Uses a local color webcam to detect any face after you have stepped away, disable the guard, and wake the monitors. Disabled on fresh installs. |
+| ChatGPT completion chime | Optional Chrome/Vivaldi extension plays a local sound after a response finishes. Requires manual browser setup. |
+| Codex completion chime | Bundled dispatcher assets support a separately configured completion hook; they are not automatically installed into Codex. |
+| Startup and recovery | Optional sign-in startup, bounded recovery after abnormal app exits, and an optional independent process-lifecycle observer. |
+| LPHA Autofill | Specialized owner-specific macro, disabled by the installer. Requires accessible form controls; the tested Citrix session does not expose them and is unsupported. |
+
+The main app runs in the Windows notification area, not as a browser extension.
+The chime extension is a separate, optional component. Monitor sleep does not lock
+or suspend the PC; use Windows' normal lock and authentication separately.
 
 ## Install on Windows
 
 Download `ImagePastor-Setup-1.1.0-windows-x64.exe` from the
 [GitHub release](https://github.com/khisanthax/imagepastor/releases/tag/v1.1.0).
-The repository is private, so sign in with an account that has access, or transfer
-the downloaded installer directly to your other PC. No Python installation is needed.
+The repository and release are public; no GitHub account or repository invitation
+is required to download. You can also transfer the installer to another PC.
+No Python installation is needed.
 
 Run the installer under the Windows account that will use ImagePastor. It installs
 to `%LOCALAPPDATA%\Programs\ImagePastor`, creates a Start menu shortcut, and offers
@@ -38,23 +58,41 @@ and dependency versions are included in the package. Each version uses a fresh
 build directory to avoid stale files. Installer compilation uses Inno Setup's
 [command-line compiler](https://jrsoftware.org/inno-setup/documentation/topic_compilercmdline.htm).
 
-Default capture hotkey: `Ctrl+Alt+V`
+## Hotkeys and Quick Start
 
-Default target hotkey: `Ctrl+Alt+Shift+V`
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+Alt+V` | Capture the source window or Vivaldi tile under the pointer and paste into the saved ChatGPT destination. |
+| `Ctrl+Alt+Shift+V` | Select the ChatGPT destination tile under the pointer; does not capture or paste. |
+| `Ctrl+Alt+Shift+M` | Toggle monitor sleep guard: off displays while enabled, cancel sleep and wake when disabled. |
+| `Ctrl+Alt+L` | Optional LPHA Autofill; disabled on fresh installs. Press again to cancel an active run. |
+| `Ctrl+Alt+Shift+L` | Optional read-only LPHA structural check; also disabled when LPHA is disabled. |
 
-Default monitor sleep guard hotkey: `Ctrl+Alt+Shift+M`
+Hotkey combinations can be changed in the local `config.json`.
 
 ImagePastor runs in the Windows notification area. Right-click its icon to toggle `Enabled`, set the current window as target, keep monitors asleep, set up the ChatGPT completion chime, enable `Start with Windows`, or exit.
 
-First, activate the ChatGPT tab in Chrome or Vivaldi and press `Ctrl+Alt+Shift+V` once. This saves that browser window as the paste target, even if the tab title is the conversation topic.
+1. Open a ChatGPT conversation in Chrome or Vivaldi.
+2. Point inside its page or destination tile and press `Ctrl+Alt+Shift+V` once.
+3. Point inside the source window or Vivaldi page you want to capture, then press
+   `Ctrl+Alt+V`.
+4. Review the attachment and write/send your message yourself. Reselect the
+   destination after navigation or an app restart when needed.
 
 When the capture hotkey fires, ImagePastor:
 
-1. Finds the top-level window under your mouse.
-2. Captures that window's visible bounds.
+1. Finds the source window and pointer location.
+2. Captures the visible window bounds, or only the hovered Vivaldi web-page tile.
 3. Places the screenshot on the Windows clipboard as an image.
-4. Finds a Chrome or Vivaldi tab whose address belongs to `chatgpt.com`, even when the tab title is a conversation topic.
-5. Verifies the window has focus and the active address is still ChatGPT before clicking the composer and sending `Ctrl+V`.
+4. Resolves the saved, URL-verified ChatGPT document and composer without scanning
+   or selecting tabs. An unavailable or ambiguous saved target cancels paste.
+5. Waits for modifier release, focuses only the verified editor, rechecks document
+   identity and keyboard focus, and sends `Ctrl+V`. No Enter or Send is used.
+
+If paste cannot be verified, the image remains on the clipboard for manual use.
+Attaching an image may upload it to ChatGPT even before you send a message, so
+check the source content before using the capture shortcut. Screenshot activity
+logs can include source window titles; review logs before sharing them.
 
 ## Run
 
@@ -62,7 +100,8 @@ When the capture hotkey fires, ImagePastor:
 .\run.ps1
 ```
 
-Keep the PowerShell window open while using the hotkey. Press `Ctrl+C` in that window to quit.
+Keep the PowerShell window open while using the app. Use the tray menu's **Exit**
+for a clean shutdown of the app and its supervisor.
 
 ## Build an EXE
 
@@ -70,7 +109,10 @@ Keep the PowerShell window open while using the hotkey. Press `Ctrl+C` in that w
 .\build.ps1
 ```
 
-The executable is written to `dist\ImagePastor.exe`. The local ChatGPT extension and Codex notifier are copied to `dist\ImagePastor-Chime` and `dist\ImagePastor-Codex`. Put a `config.json` next to the EXE if you want to override settings after packaging.
+The executables are written to `dist\ImagePastor.exe` and
+`dist\ImagePastorDiagnostics.exe`. The local ChatGPT extension and Codex notifier
+are copied to `dist\ImagePastor-Chime` and `dist\ImagePastor-Codex`. Put a
+`config.json` next to the main EXE to override settings after packaging.
 
 ## ChatGPT completion chime
 
@@ -87,7 +129,9 @@ The local Codex dispatcher uses the official `agent-turn-complete` notify event 
 
 ## Configure
 
-Copy `config.example.json` to `config.json` and edit it:
+For a source/portable build with no existing settings, copy `config.example.json`
+to `config.json`. For an installer-based installation, edit the existing file in
+`%LOCALAPPDATA%\Programs\ImagePastor` instead of replacing it:
 
 ```powershell
 Copy-Item .\config.example.json .\config.json
@@ -98,6 +142,10 @@ Useful settings:
 - `hotkey`: change the modifier keys and trigger key.
 - `target_hotkey`: change the hotkey used to mark the ChatGPT tile under the pointer as the paste target.
 - `monitor_sleep_hotkey`: change the hotkey used to toggle the monitor sleep guard.
+- `capture_vivaldi_tile`: capture only the hovered Vivaldi page (default `true`).
+- `face_wake_enabled`: opt in to local camera-based wake (default `false`).
+- `face_wake_camera_index`: choose the DirectShow camera number (default `0`).
+- `lpha_enabled`: enable the specialized LPHA hotkeys/menu; the installer sets this to `false`.
 - `chatgpt_allowed_hosts`: browser address hosts that are permitted to receive screenshots.
 - `auto_click_composer` and `composer_click_offset_from_bottom`: legacy settings; unverified window-center/bottom clicks are no longer used for paste.
 - `monitor_sleep_delay_ms`: delay before turning off monitors, so releasing the hotkey does not immediately wake them.
@@ -138,6 +186,34 @@ Useful settings:
 - Monitor power commands run on a separate thread so a slow driver transition cannot block the hotkey. `Sleep Monitors Once` and the explicit `Wake Monitors` action are also available in the tray menu. The log includes Windows' reported session display state and the duration of each power call.
 - Use the tray menu's `Start with Windows` checkbox to launch ImagePastor automatically when you sign in.
 
+## Webcam Compatibility and Setup
+
+No particular camera brand or Windows Hello model is required. The face-wake
+worker opens a normal color camera through Windows DirectShow. Standard USB
+webcams and built-in cameras can work if their Windows driver exposes a compatible
+video stream; compatibility with every device is not guaranteed.
+
+With a single webcam, you can usually just enable **Wake on Face** in the tray.
+ImagePastor tries camera index `0`; it does not scan cameras or automatically pick
+one by model. If a laptop has a built-in camera, additional USB webcams, or virtual
+cameras, index `0` may not be the one you intended. There is no camera-selection
+dialog in this release. Edit `face_wake_camera_index` in the local `config.json`
+to the correct index (`0` through `16`) and restart ImagePastor. Indexes can change
+when devices or drivers change; your other PC's camera number is not transferable.
+
+To use face wake, enable it, press the monitor sleep hotkey, and step away. After
+about two seconds without a detected face, a sustained face for about one second
+disables the sleep guard and wakes the displays. Remaining seated immediately
+after enabling the guard should not wake them again. Re-enable the guard with the
+hotkey when you next leave.
+
+This is **face detection, not recognition or authentication**: any face, including
+a convincing image, may trigger wake. It neither replaces Windows Hello nor
+unlocks Windows. No camera frames or face templates are saved or uploaded. Camera
+use stops when the guard is disabled or the Windows session locks. Close other
+camera apps if the webcam is busy; a camera/driver failure leaves the hotkey
+available but can prevent automatic face wake.
+
 ## Process Diagnostics
 
 The installed app writes local diagnostics beside `ImagePastor.exe`:
@@ -169,7 +245,8 @@ shutdown, or killing the supervisor itself can still prevent recovery or logging
 `ImagePastorDiagnostics.exe` is a separate, observation-only companion. It keeps
 Windows process handles for ImagePastor processes and records PID, parent PID,
 observed exit code, and matching Application Hang/Error event IDs in
-`dist/imagepastor-lifecycle.jsonl`. It survives termination aimed only at the
+`imagepastor-lifecycle.jsonl` beside its executable (`dist/` in a development
+build). It can survive termination aimed only at the
 ImagePastor executable/process tree. It polls every two seconds and logs its own
 heartbeat every five minutes. It does not restart apps, change monitor state,
 inspect windows, or collect screenshots, drafts, command lines, or other app data.
@@ -177,21 +254,23 @@ inspect windows, or collect screenshots, drafts, command lines, or other app dat
 The observer cannot identify the process that requested termination from an exit
 code alone. If it is also killed or Windows shuts down abruptly, a final event
 may be unavailable. Processes too short-lived to be observed can be missed.
-It is registered separately at sign-in as `ImagePastorDiagnostics` on this PC.
-
-On November 12, 2026 at 09:45:35 local time, Windows logged Application Hang 1002,
-record 55119, for outer launcher PID 78736 (`0x13390`), hang type
-`Cross-process;Quiesce`. The last worker heartbeat was 09:42:17. Both app and
-supervisor were absent when checked November 14, with no supervisor exit receipt.
-This establishes a reported hang/closure, not the underlying hang cause or who
-requested closure. Original logs remain preserved; November 11's forced exit
-was a controlled recovery test, not an unexplained crash.
+The installer offers independent diagnostics as an optional sign-in task. It is
+not enabled on every PC automatically. To stop this companion before upgrading
+or uninstalling, end `ImagePastorDiagnostics.exe` in Task Manager; exit the main
+app through its tray menu. Development incident evidence is summarized separately
+in [Diagnostic History](https://github.com/khisanthax/imagepastor/blob/main/docs/diagnostic-history.md).
 
 ## LPHA Autofill
 
-`Ctrl+Alt+L` fills the currently active Citrix session using keyboard input and
-Tab, without screen coordinates. It does not press Enter, Save, Submit, or Sign.
-The three existing ImagePastor shortcuts are unchanged.
+This specialized feature is disabled on fresh installer-based installations and
+uses the fixed provider values below. It is not a generally working Citrix
+autofill tool: the tested remote session exposes no local text fields or dropdowns.
+Do not enable it on another person's workstation without intentionally reviewing
+the provider identity and workflow.
+
+When enabled and its accessibility checks pass, `Ctrl+Alt+L` attempts to fill the
+currently active Citrix form using keyboard input and Tab, without coordinates.
+It does not press Enter, Save, Submit, or Sign. The other shortcuts are unchanged.
 
 1. Use an approved scratch/test form first. Bring the Citrix form to the foreground.
 2. Leave Printed Name, Credential, and NPI# genuinely empty. Focus the LPHA dropdown
@@ -260,7 +339,11 @@ field match does not by itself prove that remote accessibility is absent. Zero
 Edit/ComboBox controls suggests no usable local form exposure; present controls
 with missing label matches require further label verification, not relaxed checks.
 
-Real-session compatibility has not been validated by live form entry. Many VDI
+The real read-only check on the tested Citrix session found two consistent
+18-node snapshots, zero Edit/ComboBox controls, zero expected-field matches, and
+zero metadata errors. The viewer was exposed but the remote form fields were not;
+that session cannot safely be autofilled by this local implementation. No live
+form entry was performed. Many VDI
 sessions expose only a bitmap to local accessibility. In that case this feature
 aborts with `FIELDS_NOT_UNIQUE_OR_EXPOSED` or
 `ACCESSIBILITY_OR_INPUT_UNAVAILABLE`; it does not fall back to blind Tabs, OCR,
